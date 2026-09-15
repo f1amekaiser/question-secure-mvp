@@ -45,6 +45,8 @@ All users, encrypted question content, paper fingerprints, centre assignments, w
 
 The repository includes `render.yaml` for a Blueprint deployment. It asks Render for the secret `DATABASE_URL`; paste the Neon connection string into that generated environment-variable field. The app also accepts `NEON_DATABASE_URL` as a local alternative name.
 
+**Live deployment link:** https://question-secure-mvp.onrender.com/
+
 ## Main flow
 
 1. **Question Setter** logs in and creates a paper.
