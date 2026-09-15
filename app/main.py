@@ -118,40 +118,18 @@ def legacy_or_password_hash(password: str, stored: str) -> bool:
 def init_db():
     c = db()
     if DATABASE_URL:
-        old_users = c.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_name='users'"
-        ).fetchone()
-        new_users = c.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_name='app_users'"
-        ).fetchone()
-    else:
-        old_users = c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'"
-        ).fetchone()
-        new_users = c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_users'"
-        ).fetchone()
-    if DATABASE_URL:
-        # Repair an incomplete/legacy Neon schema before creating FK-dependent tables.
-        for table in ("centres",):
-            existing_id = c.execute(
-                "SELECT data_type FROM information_schema.columns WHERE table_name=? AND column_name='id'",
-                (table,),
-            ).fetchone()
-            if existing_id and existing_id["data_type"] not in ("integer", "bigint"):
-                sequence = f"{table}_id_seq"
-                c.execute(f"ALTER TABLE {table} ALTER COLUMN id DROP DEFAULT")
-                c.execute(f"ALTER TABLE {table} ALTER COLUMN id TYPE INTEGER USING id::integer")
-                c.execute(f"CREATE SEQUENCE IF NOT EXISTS {sequence}")
-                c.execute(f"SELECT setval('{sequence}', COALESCE(MAX(id), 0) + 1, false) FROM {table}")
-                c.execute(f"ALTER TABLE {table} ALTER COLUMN id SET DEFAULT nextval('{sequence}')")
-        c.commit()
+        # Preserve existing Neon ID types; UUIDs must not be cast to integers.
         existing_user_id = c.execute(
             "SELECT data_type FROM information_schema.columns WHERE table_name='app_users' AND column_name='id'"
         ).fetchone()
+        existing_centre_id = c.execute(
+            "SELECT data_type FROM information_schema.columns WHERE table_name='centres' AND column_name='id'"
+        ).fetchone()
         app_user_id_type = existing_user_id["data_type"] if existing_user_id else "integer"
+        centre_id_type = existing_centre_id["data_type"] if existing_centre_id else "integer"
     else:
         app_user_id_type = "integer"
+        centre_id_type = "integer"
     schema = """
         CREATE TABLE IF NOT EXISTS app_users(
             id INTEGER PRIMARY KEY,
@@ -219,6 +197,9 @@ def init_db():
             postgres_id_type = "UUID" if app_user_id_type == "uuid" else "TEXT"
             schema = schema.replace("id INTEGER PRIMARY KEY,", f"id {postgres_id_type} PRIMARY KEY,")
             schema = schema.replace("author_id INTEGER NOT NULL", f"author_id {postgres_id_type} NOT NULL")
+        if centre_id_type in ("character varying", "text", "uuid"):
+            postgres_centre_type = "UUID" if centre_id_type == "uuid" else "TEXT"
+            schema = schema.replace("centre_id INTEGER", f"centre_id {postgres_centre_type}")
     c.executescript(schema)
 
     # Gentle migration for the first MVP schema.
@@ -227,7 +208,8 @@ def init_db():
     else:
         cols = {r[1] for r in c.execute("PRAGMA table_info(app_users)").fetchall()}
     if "centre_id" not in cols:
-        c.execute("ALTER TABLE app_users ADD COLUMN centre_id INTEGER")
+        centre_column_type = "UUID" if DATABASE_URL and centre_id_type == "uuid" else ("TEXT" if DATABASE_URL and centre_id_type in ("character varying", "text") else "INTEGER")
+        c.execute(f"ALTER TABLE app_users ADD COLUMN centre_id {centre_column_type}")
     if DATABASE_URL:
         paper_cols = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='papers'").fetchall()}
     else:
@@ -238,29 +220,6 @@ def init_db():
         c.execute("ALTER TABLE papers ADD COLUMN puzzle_seed TEXT NOT NULL DEFAULT ''")
     if "puzzle_rounds" not in paper_cols:
         c.execute("ALTER TABLE papers ADD COLUMN puzzle_rounds INTEGER NOT NULL DEFAULT 0")
-
-    # Keep the legacy users table untouched; copy its account records into the new table.
-    if old_users:
-        if DATABASE_URL:
-            c.execute(
-                f"""
-                INSERT INTO app_users(id,username,password_hash,role,author_scope,centre_id)
-                SELECT {"id" if app_user_id_type == "uuid" else "id::text"},username,password_hash,role,author_scope,centre_id
-                FROM users
-                ON CONFLICT (id) DO NOTHING
-                """
-            )
-            if app_user_id_type == "integer":
-                c.execute("SELECT setval('app_users_id_seq', COALESCE(MAX(id), 0) + 1, false) FROM app_users")
-        else:
-            c.execute(
-                """
-                INSERT OR IGNORE INTO app_users(id,username,password_hash,role,author_scope,centre_id)
-                SELECT CAST(id AS INTEGER),username,password_hash,role,author_scope,centre_id
-                FROM users
-                """
-            )
-        c.commit()
 
     seed_centres = [
         ("CIT Coimbatore", "CIT001", "Coimbatore, Tamil Nadu"),
@@ -324,7 +283,7 @@ def init_db():
             (row["id"], centre[0], secrets.token_hex(12)),
         )
 
-    # Upgrade legacy users to the renamed roles.
+    # Normalize legacy role values inside the application-owned account table.
     c.execute("UPDATE app_users SET role='setter' WHERE role='author'")
     c.commit()
     c.close()
@@ -425,7 +384,7 @@ class PaperIn(BaseModel):
     description: str = Field(default="", max_length=1000)
     content: str = Field(min_length=1, max_length=200000)
     release_at: int = Field(gt=0)
-    centre_ids: List[int] = Field(min_length=1)
+    centre_ids: List[str] = Field(min_length=1)
 
 
 @app.get("/")
