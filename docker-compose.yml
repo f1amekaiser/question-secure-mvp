@@ -7,5 +7,7 @@ services:
       - ./data:/app/data
     environment:
       APP_SECRET: change-this-in-production
+      # Set DATABASE_URL to a managed PostgreSQL URL for production.
+      # Without it, local development uses ./data/mvp.db.
       PUZZLE_ROUNDS_PER_DAY: 1000
       MAX_PUZZLE_ROUNDS: 2000000

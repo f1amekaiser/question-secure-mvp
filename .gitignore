@@ -1,0 +1,36 @@
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
+# Local application data
+/data/*.db
+/data/*.sqlite
+/data/*.sqlite3
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Coverage and build artifacts
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

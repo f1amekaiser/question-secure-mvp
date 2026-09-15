@@ -1,6 +1,19 @@
 # EPSS — Exam Paper Secure System MVP
 
-A deployable FastAPI + SQLite + browser client MVP for secure question-paper creation and controlled exam-centre delivery.
+A deployable FastAPI + PostgreSQL/SQLite + browser client MVP for secure question-paper creation and controlled exam-centre delivery.
+
+## Render deployment
+
+Use a **Neon PostgreSQL** database as the external store. In Neon, create a project and copy its **pooled connection string**. In Render, add it to the web service environment variables as `DATABASE_URL`:
+
+- `DATABASE_URL` — Neon pooled connection string, including `sslmode=require` if Neon did not already include it.
+- `APP_SECRET` — generate a long random secret; do not use the repository example.
+- `PUZZLE_ROUNDS_PER_DAY` — optional puzzle effort setting.
+- `MAX_PUZZLE_ROUNDS` — optional upper bound for puzzle effort.
+
+All users, encrypted question content, paper fingerprints, centre assignments, watermarks, audit events, and alerts are stored in PostgreSQL when `DATABASE_URL` is set. No application data is written to the Render web service filesystem. The app automatically creates and seeds its tables on startup. `./data/mvp.db` is used only when `DATABASE_URL` is absent for local development.
+
+The repository includes `render.yaml` for a Blueprint deployment. It asks Render for the secret `DATABASE_URL`; paste the Neon connection string into that generated environment-variable field. The app also accepts `NEON_DATABASE_URL` as a local alternative name.
 
 ## Main flow
 

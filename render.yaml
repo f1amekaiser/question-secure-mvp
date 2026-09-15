@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: epss-secure-mvp
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_SECRET
+        generateValue: true
+      - key: PUZZLE_ROUNDS_PER_DAY
+        value: "1000"
+      - key: MAX_PUZZLE_ROUNDS
+        value: "2000000"

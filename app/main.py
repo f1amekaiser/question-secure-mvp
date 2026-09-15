@@ -18,6 +18,11 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent.parent
 DB = ROOT / "data" / "mvp.db"
 DB.parent.mkdir(exist_ok=True)
+DATABASE_URL = (os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL", "")).strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+if DATABASE_URL and "sslmode=" not in DATABASE_URL.lower():
+    DATABASE_URL += "&sslmode=require" if "?" in DATABASE_URL else "?sslmode=require"
 SECRET = os.environ.get("APP_SECRET", "dev-only-secret-change-me").encode()
 KEY = hashlib.sha256(SECRET + b"|paper-encryption").digest()  # demo key; production: KMS/HSM
 PUZZLE_ROUNDS_PER_DAY = max(1, int(os.environ.get("PUZZLE_ROUNDS_PER_DAY", "1000")))
@@ -25,7 +30,57 @@ MAX_PUZZLE_ROUNDS = max(1000, int(os.environ.get("MAX_PUZZLE_ROUNDS", "2000000")
 app = FastAPI(title="EPSS - Exam Paper Secure System", version="0.2.0")
 
 
+class AccessRow(dict):
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+class PostgresCursor:
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.lastrowid = None
+
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        return AccessRow(row) if row else None
+
+    def fetchall(self):
+        return [AccessRow(row) for row in self.cursor.fetchall()]
+
+
+class PostgresConnection:
+    is_postgres = True
+
+    def __init__(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        self.connection = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+    def execute(self, query, params=()):
+        query = query.replace("?", "%s")
+        return PostgresCursor(self.connection.execute(query, params))
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            if statement.strip():
+                self.execute(statement)
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
+
 def db():
+    if DATABASE_URL:
+        return PostgresConnection()
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys = ON")
@@ -61,8 +116,7 @@ def legacy_or_password_hash(password: str, stored: str) -> bool:
 
 def init_db():
     c = db()
-    c.executescript(
-        """
+    schema = """
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
@@ -123,13 +177,21 @@ def init_db():
             resolved INTEGER DEFAULT 0
         );
         """
-    )
+    if DATABASE_URL:
+        schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    c.executescript(schema)
 
     # Gentle migration for the first MVP schema.
-    cols = {r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
+    if DATABASE_URL:
+        cols = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users'").fetchall()}
+    else:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
     if "centre_id" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN centre_id INTEGER")
-    paper_cols = {r[1] for r in c.execute("PRAGMA table_info(papers)").fetchall()}
+    if DATABASE_URL:
+        paper_cols = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='papers'").fetchall()}
+    else:
+        paper_cols = {r[1] for r in c.execute("PRAGMA table_info(papers)").fetchall()}
     if "description" not in paper_cols:
         c.execute("ALTER TABLE papers ADD COLUMN description TEXT DEFAULT ''")
     if "puzzle_seed" not in paper_cols:
@@ -148,7 +210,7 @@ def init_db():
     ]
     for name, code, location in seed_centres:
         c.execute(
-            "INSERT OR IGNORE INTO centres(name,code,location,status,created_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO centres(name,code,location,status,created_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING" if DATABASE_URL else "INSERT OR IGNORE INTO centres(name,code,location,status,created_at) VALUES(?,?,?,?,?)",
             (name, code, location, "ACTIVE", now_ts()),
         )
 
@@ -189,7 +251,7 @@ def init_db():
         if not centre:
             centre = c.execute("SELECT id FROM centres WHERE code='CIT001'").fetchone()
         c.execute(
-            "INSERT OR IGNORE INTO paper_centres(paper_id,centre_id,watermark) VALUES(?,?,?)",
+            "INSERT INTO paper_centres(paper_id,centre_id,watermark) VALUES(?,?,?) ON CONFLICT DO NOTHING" if DATABASE_URL else "INSERT OR IGNORE INTO paper_centres(paper_id,centre_id,watermark) VALUES(?,?,?)",
             (row["id"], centre[0], secrets.token_hex(12)),
         )
 
@@ -368,12 +430,17 @@ def create_centre(x: CentreIn, request: Request):
     c = db()
     try:
         cur = c.execute(
-            "INSERT INTO centres(name,code,location,status,created_at) VALUES(?,?,?,?,?)",
+            ("INSERT INTO centres(name,code,location,status,created_at) VALUES(?,?,?,?,?) RETURNING id" if DATABASE_URL else "INSERT INTO centres(name,code,location,status,created_at) VALUES(?,?,?,?,?)"),
             (x.name.strip(), x.code.strip().upper(), x.location.strip(), "ACTIVE", now_ts()),
         )
-        cid = cur.lastrowid
+        cid = cur.fetchone()["id"] if DATABASE_URL else cur.lastrowid
         c.commit()
-    except sqlite3.IntegrityError as e:
+    except Exception as e:
+        is_integrity_error = isinstance(e, sqlite3.IntegrityError) or (
+            DATABASE_URL and e.__class__.__module__.startswith("psycopg")
+        )
+        if not is_integrity_error:
+            raise
         c.rollback()
         c.close()
         raise HTTPException(409, "Centre name or code already exists") from e
@@ -406,10 +473,10 @@ def create_paper(p: PaperIn, request: Request):
     puzzle_seed = secrets.token_hex(32)
     puzzle_rounds = puzzle_rounds_for(p.release_at)
     cur = c.execute(
-        "INSERT INTO papers(title,description,author_id,content_hash,ciphertext,nonce,release_at,created_at,puzzle_seed,puzzle_rounds) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("INSERT INTO papers(title,description,author_id,content_hash,ciphertext,nonce,release_at,created_at,puzzle_seed,puzzle_rounds) VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING id" if DATABASE_URL else "INSERT INTO papers(title,description,author_id,content_hash,ciphertext,nonce,release_at,created_at,puzzle_seed,puzzle_rounds) VALUES(?,?,?,?,?,?,?,?,?,?)"),
         (p.title.strip(), p.description.strip(), u["id"], digest, base64.b64encode(ciphertext).decode(), base64.b64encode(nonce).decode(), p.release_at, now_ts(), puzzle_seed, puzzle_rounds),
     )
-    pid = cur.lastrowid
+    pid = cur.fetchone()["id"] if DATABASE_URL else cur.lastrowid
     watermark_map = {}
     for centre in centres:
         watermark = "EPSS-" + secrets.token_hex(12).upper()
@@ -429,33 +496,34 @@ def setter_papers(request: Request):
     u = current_user(request)
     require_setter(u)
     c = db()
+    centre_codes_aggregate = "STRING_AGG(c.code, ', ')" if DATABASE_URL else "GROUP_CONCAT(c.code, ', ')"
     if u["role"] == "admin":
         rows = c.execute(
-            """
+            f"""
             SELECT p.id,p.title,p.description,p.content_hash,p.release_at,p.created_at,p.unlocked,
                    u.username author,
                    COUNT(pc.centre_id) centre_count,
-                   GROUP_CONCAT(c.code, ', ') centre_codes
+                   {centre_codes_aggregate} centre_codes
             FROM papers p
             JOIN users u ON u.id=p.author_id
             LEFT JOIN paper_centres pc ON pc.paper_id=p.id
             LEFT JOIN centres c ON c.id=pc.centre_id
-            GROUP BY p.id ORDER BY p.id DESC
+            GROUP BY p.id, u.username ORDER BY p.id DESC
             """
         ).fetchall()
     else:
         rows = c.execute(
-            """
+            f"""
             SELECT p.id,p.title,p.description,p.content_hash,p.release_at,p.created_at,p.unlocked,
                    u.username author,
                    COUNT(pc.centre_id) centre_count,
-                   GROUP_CONCAT(c.code, ', ') centre_codes
+                   {centre_codes_aggregate} centre_codes
             FROM papers p
             JOIN users u ON u.id=p.author_id
             LEFT JOIN paper_centres pc ON pc.paper_id=p.id
             LEFT JOIN centres c ON c.id=pc.centre_id
             WHERE p.author_id=?
-            GROUP BY p.id ORDER BY p.id DESC
+            GROUP BY p.id, u.username ORDER BY p.id DESC
             """,
             (u["id"],),
         ).fetchall()
