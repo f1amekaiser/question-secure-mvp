@@ -252,10 +252,17 @@ def init_db():
                     (str(uuid.uuid4()) if app_user_id_type == "uuid" else secrets.token_hex(16), username, ph, role, scope, centre_id),
                 )
             else:
-                c.execute(
-                    "INSERT INTO app_users(username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?)",
-                    (username, ph, role, scope, centre_id),
-                )
+                if DATABASE_URL:
+                    next_id = c.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM app_users").fetchone()["next_id"]
+                    c.execute(
+                        "INSERT INTO app_users(id,username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?,?)",
+                        (next_id, username, ph, role, scope, centre_id),
+                    )
+                else:
+                    c.execute(
+                        "INSERT INTO app_users(username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?)",
+                        (username, ph, role, scope, centre_id),
+                    )
 
     cit = c.execute("SELECT id FROM centres WHERE code='CIT001'").fetchone()[0]
     ssn = c.execute("SELECT id FROM centres WHERE code='SSN001'").fetchone()[0]
