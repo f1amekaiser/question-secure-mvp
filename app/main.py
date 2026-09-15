@@ -6,6 +6,7 @@ import os
 import secrets
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
@@ -132,7 +133,7 @@ def init_db():
         ).fetchone()
     if DATABASE_URL:
         # Repair an incomplete/legacy Neon schema before creating FK-dependent tables.
-        for table in ("app_users", "centres"):
+        for table in ("centres",):
             existing_id = c.execute(
                 "SELECT data_type FROM information_schema.columns WHERE table_name=? AND column_name='id'",
                 (table,),
@@ -145,6 +146,12 @@ def init_db():
                 c.execute(f"SELECT setval('{sequence}', COALESCE(MAX(id), 0) + 1, false) FROM {table}")
                 c.execute(f"ALTER TABLE {table} ALTER COLUMN id SET DEFAULT nextval('{sequence}')")
         c.commit()
+        existing_user_id = c.execute(
+            "SELECT data_type FROM information_schema.columns WHERE table_name='app_users' AND column_name='id'"
+        ).fetchone()
+        app_user_id_type = existing_user_id["data_type"] if existing_user_id else "integer"
+    else:
+        app_user_id_type = "integer"
     schema = """
         CREATE TABLE IF NOT EXISTS app_users(
             id INTEGER PRIMARY KEY,
@@ -208,6 +215,10 @@ def init_db():
         """
     if DATABASE_URL:
         schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+        if app_user_id_type in ("character varying", "text", "uuid"):
+            postgres_id_type = "UUID" if app_user_id_type == "uuid" else "TEXT"
+            schema = schema.replace("id INTEGER PRIMARY KEY,", f"id {postgres_id_type} PRIMARY KEY,")
+            schema = schema.replace("author_id INTEGER NOT NULL", f"author_id {postgres_id_type} NOT NULL")
     c.executescript(schema)
 
     # Gentle migration for the first MVP schema.
@@ -232,14 +243,15 @@ def init_db():
     if old_users:
         if DATABASE_URL:
             c.execute(
-                """
+                f"""
                 INSERT INTO app_users(id,username,password_hash,role,author_scope,centre_id)
-                SELECT id::integer,username,password_hash,role,author_scope,centre_id
+                SELECT {"id" if app_user_id_type == "uuid" else "id::text"},username,password_hash,role,author_scope,centre_id
                 FROM users
                 ON CONFLICT (id) DO NOTHING
                 """
             )
-            c.execute("SELECT setval('app_users_id_seq', COALESCE(MAX(id), 0) + 1, false) FROM app_users")
+            if app_user_id_type == "integer":
+                c.execute("SELECT setval('app_users_id_seq', COALESCE(MAX(id), 0) + 1, false) FROM app_users")
         else:
             c.execute(
                 """
@@ -275,10 +287,16 @@ def init_db():
                 (ph, role, scope, centre_id, existing["id"]),
             )
         else:
-            c.execute(
-                "INSERT INTO app_users(username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?)",
-                (username, ph, role, scope, centre_id),
-            )
+            if DATABASE_URL and app_user_id_type in ("character varying", "text", "uuid"):
+                c.execute(
+                    "INSERT INTO app_users(id,username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?,?)",
+                    (str(uuid.uuid4()) if app_user_id_type == "uuid" else secrets.token_hex(16), username, ph, role, scope, centre_id),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO app_users(username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?)",
+                    (username, ph, role, scope, centre_id),
+                )
 
     cit = c.execute("SELECT id FROM centres WHERE code='CIT001'").fetchone()[0]
     ssn = c.execute("SELECT id FROM centres WHERE code='SSN001'").fetchone()[0]
@@ -333,7 +351,7 @@ def current_user(request: Request):
         if not hmac.compare_digest(expected, sig):
             raise ValueError
         parts = payload.decode().split(":")
-        uid = int(parts[0])
+        uid = parts[0]
         issued = int(parts[2])
         if now_ts() - issued > 8 * 60 * 60:
             raise ValueError
