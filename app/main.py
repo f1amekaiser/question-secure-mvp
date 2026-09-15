@@ -116,6 +116,16 @@ def legacy_or_password_hash(password: str, stored: str) -> bool:
 
 def init_db():
     c = db()
+    if DATABASE_URL:
+        # Repair an incomplete/legacy Neon schema before creating FK-dependent tables.
+        for table in ("users", "centres"):
+            existing_id = c.execute(
+                "SELECT data_type FROM information_schema.columns WHERE table_name=? AND column_name='id'",
+                (table,),
+            ).fetchone()
+            if existing_id and existing_id["data_type"] not in ("integer", "bigint"):
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN id TYPE INTEGER USING id::integer")
+        c.commit()
     schema = """
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY,
