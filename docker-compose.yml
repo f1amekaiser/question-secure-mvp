@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      APP_SECRET: change-this-in-production
+      PUZZLE_ROUNDS_PER_DAY: 1000
+      MAX_PUZZLE_ROUNDS: 2000000
