@@ -130,9 +130,6 @@ def init_db():
         new_users = c.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_users'"
         ).fetchone()
-    if old_users and not new_users:
-        c.execute("ALTER TABLE users RENAME TO app_users")
-        c.commit()
     if DATABASE_URL:
         # Repair an incomplete/legacy Neon schema before creating FK-dependent tables.
         for table in ("app_users", "centres"):
@@ -141,7 +138,12 @@ def init_db():
                 (table,),
             ).fetchone()
             if existing_id and existing_id["data_type"] not in ("integer", "bigint"):
+                sequence = f"{table}_id_seq"
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN id DROP DEFAULT")
                 c.execute(f"ALTER TABLE {table} ALTER COLUMN id TYPE INTEGER USING id::integer")
+                c.execute(f"CREATE SEQUENCE IF NOT EXISTS {sequence}")
+                c.execute(f"SELECT setval('{sequence}', COALESCE(MAX(id), 0) + 1, false) FROM {table}")
+                c.execute(f"ALTER TABLE {table} ALTER COLUMN id SET DEFAULT nextval('{sequence}')")
         c.commit()
     schema = """
         CREATE TABLE IF NOT EXISTS app_users(
@@ -225,6 +227,28 @@ def init_db():
         c.execute("ALTER TABLE papers ADD COLUMN puzzle_seed TEXT NOT NULL DEFAULT ''")
     if "puzzle_rounds" not in paper_cols:
         c.execute("ALTER TABLE papers ADD COLUMN puzzle_rounds INTEGER NOT NULL DEFAULT 0")
+
+    # Keep the legacy users table untouched; copy its account records into the new table.
+    if old_users:
+        if DATABASE_URL:
+            c.execute(
+                """
+                INSERT INTO app_users(id,username,password_hash,role,author_scope,centre_id)
+                SELECT id::integer,username,password_hash,role,author_scope,centre_id
+                FROM users
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
+            c.execute("SELECT setval('app_users_id_seq', COALESCE(MAX(id), 0) + 1, false) FROM app_users")
+        else:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO app_users(id,username,password_hash,role,author_scope,centre_id)
+                SELECT CAST(id AS INTEGER),username,password_hash,role,author_scope,centre_id
+                FROM users
+                """
+            )
+        c.commit()
 
     seed_centres = [
         ("CIT Coimbatore", "CIT001", "Coimbatore, Tamil Nadu"),
