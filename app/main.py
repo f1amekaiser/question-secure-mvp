@@ -117,8 +117,25 @@ def legacy_or_password_hash(password: str, stored: str) -> bool:
 def init_db():
     c = db()
     if DATABASE_URL:
+        old_users = c.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name='users'"
+        ).fetchone()
+        new_users = c.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name='app_users'"
+        ).fetchone()
+    else:
+        old_users = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'"
+        ).fetchone()
+        new_users = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_users'"
+        ).fetchone()
+    if old_users and not new_users:
+        c.execute("ALTER TABLE users RENAME TO app_users")
+        c.commit()
+    if DATABASE_URL:
         # Repair an incomplete/legacy Neon schema before creating FK-dependent tables.
-        for table in ("users", "centres"):
+        for table in ("app_users", "centres"):
             existing_id = c.execute(
                 "SELECT data_type FROM information_schema.columns WHERE table_name=? AND column_name='id'",
                 (table,),
@@ -127,7 +144,7 @@ def init_db():
                 c.execute(f"ALTER TABLE {table} ALTER COLUMN id TYPE INTEGER USING id::integer")
         c.commit()
     schema = """
-        CREATE TABLE IF NOT EXISTS users(
+        CREATE TABLE IF NOT EXISTS app_users(
             id INTEGER PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
@@ -156,7 +173,7 @@ def init_db():
             puzzle_seed TEXT NOT NULL DEFAULT '',
             puzzle_rounds INTEGER NOT NULL DEFAULT 0,
             unlocked INTEGER DEFAULT 0,
-            FOREIGN KEY(author_id) REFERENCES users(id)
+            FOREIGN KEY(author_id) REFERENCES app_users(id)
         );
         CREATE TABLE IF NOT EXISTS paper_centres(
             paper_id INTEGER NOT NULL,
@@ -193,11 +210,11 @@ def init_db():
 
     # Gentle migration for the first MVP schema.
     if DATABASE_URL:
-        cols = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users'").fetchall()}
+        cols = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='app_users'").fetchall()}
     else:
-        cols = {r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
+        cols = {r[1] for r in c.execute("PRAGMA table_info(app_users)").fetchall()}
     if "centre_id" not in cols:
-        c.execute("ALTER TABLE users ADD COLUMN centre_id INTEGER")
+        c.execute("ALTER TABLE app_users ADD COLUMN centre_id INTEGER")
     if DATABASE_URL:
         paper_cols = {r["column_name"] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='papers'").fetchall()}
     else:
@@ -226,16 +243,16 @@ def init_db():
 
     # Create demo accounts or repair the legacy account records.
     def upsert_user(username, password, role, centre_id=None, scope="all"):
-        existing = c.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        existing = c.execute("SELECT * FROM app_users WHERE username=?", (username,)).fetchone()
         ph = hash_password(password)
         if existing:
             c.execute(
-                "UPDATE users SET password_hash=?, role=?, author_scope=?, centre_id=? WHERE id=?",
+                "UPDATE app_users SET password_hash=?, role=?, author_scope=?, centre_id=? WHERE id=?",
                 (ph, role, scope, centre_id, existing["id"]),
             )
         else:
             c.execute(
-                "INSERT INTO users(username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?)",
+                "INSERT INTO app_users(username,password_hash,role,author_scope,centre_id) VALUES(?,?,?,?,?)",
                 (username, ph, role, scope, centre_id),
             )
 
@@ -266,7 +283,7 @@ def init_db():
         )
 
     # Upgrade legacy users to the renamed roles.
-    c.execute("UPDATE users SET role='setter' WHERE role='author'")
+    c.execute("UPDATE app_users SET role='setter' WHERE role='author'")
     c.commit()
     c.close()
 
@@ -299,7 +316,7 @@ def current_user(request: Request):
     except Exception:
         raise HTTPException(401, "Invalid or expired session")
     c = db()
-    u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    u = c.execute("SELECT * FROM app_users WHERE id=?", (uid,)).fetchone()
     c.close()
     if not u:
         raise HTTPException(401, "Unknown user")
@@ -384,7 +401,7 @@ def login(x: Login, request: Request):
     if x.login_as not in ("setter", "exam_centre"):
         raise HTTPException(400, "Invalid login type")
     c = db()
-    u = c.execute("SELECT * FROM users WHERE username=?", (x.username,)).fetchone()
+    u = c.execute("SELECT * FROM app_users WHERE username=?", (x.username,)).fetchone()
     c.close()
     if not u or not legacy_or_password_hash(x.password, u["password_hash"]):
         audit(None, x.username, x.login_as, "LOGIN_FAILED", request, f"login_as={x.login_as}")
@@ -515,7 +532,7 @@ def setter_papers(request: Request):
                    COUNT(pc.centre_id) centre_count,
                    {centre_codes_aggregate} centre_codes
             FROM papers p
-            JOIN users u ON u.id=p.author_id
+            JOIN app_users u ON u.id=p.author_id
             LEFT JOIN paper_centres pc ON pc.paper_id=p.id
             LEFT JOIN centres c ON c.id=pc.centre_id
             GROUP BY p.id, u.username ORDER BY p.id DESC
@@ -529,7 +546,7 @@ def setter_papers(request: Request):
                    COUNT(pc.centre_id) centre_count,
                    {centre_codes_aggregate} centre_codes
             FROM papers p
-            JOIN users u ON u.id=p.author_id
+            JOIN app_users u ON u.id=p.author_id
             LEFT JOIN paper_centres pc ON pc.paper_id=p.id
             LEFT JOIN centres c ON c.id=pc.centre_id
             WHERE p.author_id=?
